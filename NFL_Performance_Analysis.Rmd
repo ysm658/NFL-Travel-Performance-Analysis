@@ -1,0 +1,165 @@
+---
+title: "fianl_project"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(readr)
+library(corrplot)
+library(broom)
+library(purrr)
+library(mgcv)
+library(randomForest)
+summary(nfl_stats['away_days_since_last_game'])
+```
+
+```{r}
+df <- read_csv("nfl_stats.csv")
+df$home_travel_distance <- 0
+nfl_stats <- df[, c(
+  "away_epa_total",
+  "away_epa_offense_total",
+  "away_epa_offense_pass",
+  "away_epa_offense_rush",
+  "away_epa_defense_total",
+  "away_epa_defense_pass",
+  "away_epa_defense_rush",
+  "away_points",
+  "away_travel_distance",
+  "tz_change",
+  "away_days_since_last_game"
+)]
+
+
+```
+```{r}
+nfl_long <- nfl_stats %>%
+  select(away_travel_distance, away_days_since_last_game, away_epa_offense_total, away_epa_defense_total) %>%
+  pivot_longer(cols = c(away_epa_offense_total, away_epa_defense_total),
+               names_to = "epa_type",
+               values_to = "epa_value")
+
+ggplot(nfl_long, aes(x = away_travel_distance, y = epa_value, color = epa_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c(
+    "away_epa_offense_total" = "blue",
+    "away_epa_defense_total" = "orange"
+  ),
+  labels = c("Offense EPA", "Defense EPA")) +
+  labs(
+    title = "EPA vs Travel Distance",
+    x = "Travel Distance (miles)",
+    y = "Expected Points Added (EPA)",
+    color = "EPA Type"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+ggplot(nfl_long, aes(x = away_days_since_last_game, y = epa_value, color = epa_type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c(
+    "away_epa_offense_total" = "blue",
+    "away_epa_defense_total" = "orange"
+  ),
+  labels = c("Offense EPA", "Defense EPA")) +
+  labs(
+    title = "EPA vs Days Since Last Game",
+    x = "Days Since Last Game",
+    y = "Expected Points Added (EPA)",
+    color = "EPA Type"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+nfl_stats$travel_distance <- nfl_stats$away_travel_distance / 100
+nfl_stats$travel_distance_sq <- nfl_stats$travel_distance^2
+dependent_vars <- c("away_epa_total","away_epa_offense_total", "away_epa_offense_pass", "away_epa_offense_rush", "away_epa_defense_total", "away_epa_defense_pass")
+
+formulas <- setNames(lapply(dependent_vars, function(y) 
+  as.formula(paste(y, "~ travel_distance + travel_distance_sq + away_days_since_last_game + tz_change"))), dependent_vars)
+
+models <- lapply(formulas, function(formula) {
+  lm(formula, data = nfl_stats)
+})
+
+lm_summaries <- lapply(models, function(model) {
+  tidy(model)
+})
+
+lm_summaries <- map2(models, names(models), function(model, name) {
+  tidy(model) |> 
+    mutate(dependent_var = name)
+}) |> 
+  bind_rows()
+lm_summaries |> 
+  filter(term %in% c("travel_distance", "away_days_since_last_game", "travel_distance_sq", "tz_change"),
+         p.value < 0.05)
+```
+
+
+```{r}
+nfl_stats$rest_bin <- cut(nfl_stats$away_days_since_last_game, breaks = c(0, 4, 6, 9), labels = c("Short", "Medium", "Long"), right = FALSE)
+nfl_stats$distance_bin <- cut(nfl_stats$travel_distance, breaks = c(0, 5, 10, Inf), labels = c("Short", "Medium", "Long"), right = FALSE)
+
+# Fit linear models using bins
+binned_models <- lapply(dependent_vars, function(y) {
+  formula <- as.formula(paste0(y, " ~ distance_bin + rest_bin"))
+  lm(formula, data = nfl_stats)
+})
+
+# Extract summaries
+binned_summaries <- map2(binned_models, dependent_vars, function(model, name) {
+  tibble(dependent_var = name,
+         binned_aic = AIC(model),
+         binned_adj_r2 = summary(model)$adj.r.squared)
+})
+```
+
+```{r}
+nfl_stats$rest_bin <- cut(
+  nfl_stats$away_days_since_last_game,
+  breaks = c(-Inf, 5, 8, Inf),  # includes values ≤5, 6–8, 9+
+  labels = c("Short", "Medium", "Long"),
+  right = TRUE
+)
+
+nfl_stats$travel_tz_interaction <- nfl_stats$travel_distance * nfl_stats$tz_change
+
+rf_formula_base <- " ~ travel_distance + tz_change + away_days_since_last_game + travel_tz_interaction"
+
+# Loop over dependent variables
+rf_models <- map(dependent_vars, function(y) {
+  formula <- as.formula(paste0(y, rf_formula_base))
+  randomForest(formula, data = nfl_stats, ntree = 500, importance = TRUE)
+})
+
+# Extract variable importance
+rf_importance <- map2(rf_models, dependent_vars, function(model, name) {
+  importance_df <- as.data.frame(importance(model))
+  importance_df$term <- rownames(importance_df)
+  importance_df$dependent_var <- name
+  rownames(importance_df) <- NULL
+  importance_df
+})
+
+# Combine all into one tibble
+rf_importance_all <- bind_rows(rf_importance)
+
+rf_importance_all %>%
+  arrange(dependent_var, desc('%IncMSE')) %>%
+  select(dependent_var, term, '%IncMSE')
+```
+
+```{r}
+cor_matrix <- cor(nfl_stats, use = "complete.obs", method = "pearson")
+cor_matrix[c("away_days_since_last_game","travel_distance"), ]
+```
+
+
